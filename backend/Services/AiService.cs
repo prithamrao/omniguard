@@ -28,7 +28,19 @@ public sealed class AiService
     public async Task<AiAssessment> ScoreAsync(FeatureSet f, FeatureSet storm, CancellationToken ct = default)
     {
         // The AI never sees the terrain model's score, so it gives an independent second opinion.
-        const string system =
+        // Describe the chosen rainfall so the AI can scale its judgment to it.
+        double rain = storm.RainInches;
+        string amount = $"{rain.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture)} inches of rain in 24 hours";
+        string severity = rain >= 15 ? "an extreme, record-flood amount — far beyond what neighborhood drainage is designed for"
+            : rain >= 6 ? "a severe storm, around a 100-year event for most of the US"
+            : rain >= 3 ? "a very heavy storm"
+            : rain > 1 ? "a heavy storm"
+            : rain < 1 ? "lighter than an ordinary rain"
+            : "an ordinary rain";
+        string stormRule = rain > 1
+            ? "runoff, ponding and overflow all grow with rainfall, so it must be at least riskScore, scaled to how extreme this rainfall is"
+            : rain < 1 ? "less water than an ordinary rain, so it must be at most riskScore" : "the same as riskScore";
+        string system =
             "You are an experienced stormwater engineer giving a homeowner a quick flood-risk " +
             "second opinion for one property, from measured terrain data. Judge the risk yourself " +
             "using engineering sense, for example: a house in a closed low spot or on a drainage path " +
@@ -36,9 +48,8 @@ public sealed class AiService
             "with little uphill drainage is low risk even when heavily paved; paving matters most when " +
             "water also has nowhere to go. Scale: 0-24 Low, 25-49 Moderate, 50-74 High, 75-100 Severe. " +
             "Return ONE JSON object with keys: riskScore (integer 0-100, for a normal 1-inch rain), " +
-            "stormRiskScore (integer 0-100, for a heavy 2.5-inch storm: runoff, ponding and overflow all grow, so " +
-            "it must be at least riskScore and is usually clearly higher unless the property is plainly safe), " +
-            "stormNote (one short sentence on what changes for this property in the heavy storm), " +
+            $"stormRiskScore (integer 0-100, for {amount} — {severity}: {stormRule}), " +
+            $"stormNote (one short sentence on what changes for this property with {amount}), " +
             "category (Low, Moderate, High or Severe, matching riskScore), summary (one short sentence naming the main reason), " +
             "issues (the specific problems, in plain words a homeowner understands, separated by " +
             "semicolons; use ONLY the facts tagged 'Concern:' under 'Observed facts' and never list an " +
@@ -63,7 +74,7 @@ public sealed class AiService
             $"height vs. neighborhood average={-f.RelativeLow:+0.00;-0.00} m, " +
             $"paved/built-on ground={f.Imperviousness:F0}%, {low}.\n" +
             "Observed facts (normal 1-inch rain):\n- " + string.Join("\n- ", f.Observations) +
-            (stormOnly.Count > 0 ? "\nAdditional facts in a 2.5-inch storm:\n- " + string.Join("\n- ", stormOnly) : "");
+            (stormOnly.Count > 0 ? $"\nAdditional facts with {amount}:\n- " + string.Join("\n- ", stormOnly) : "");
 
         var body = new
         {
@@ -104,7 +115,13 @@ public sealed class AiService
         int Score(string key, int fallback) => root.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.Number
             ? Math.Clamp((int)Math.Round(v.GetDouble()), 0, 100) : fallback;
         int score = Score("riskScore", (int)Math.Round(f.DeterministicRisk));
-        int stormScore = Math.Max(score, Score("stormRiskScore", score));   // a bigger storm is never safer
+        // More rain is never safer, and less than an ordinary rain is never riskier.
+        int stormRaw = Score("stormRiskScore", score);
+        // Consistency floor: at least the normal-rain score plus the terrain model's rise for this rainfall,
+        // so a bigger storm can never read safer than a smaller one.
+        int floor = Math.Clamp(score + (int)Math.Round(storm.DeterministicRisk - f.DeterministicRisk), 0, 100);
+        int stormScore = rain > 1 ? Math.Max(Math.Max(score, floor), stormRaw)
+            : rain < 1 ? Math.Min(score, stormRaw) : score;
         string summary = root.TryGetProperty("summary", out var sm) ? sm.GetString() ?? "" : "";
         string issues = root.TryGetProperty("issues", out var iss) ? iss.GetString() ?? "" : "";
         string recommendation = root.TryGetProperty("recommendation", out var rc) ? rc.GetString() ?? "" : "";

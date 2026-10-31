@@ -160,16 +160,21 @@ app.MapPost("/api/assess", async (AreaService area, AiService ai, ParcelService 
     LotDrainage? surface = null;
     if (parcel is not null && solar.Enabled)
         surface = await solar.AnalyzeLotAsync(parcel, area.NearestStreet(a, new Coord(parcel.Lat, parcel.Lng)), ct);
-    var opts = new AssessOptions(parcel, string.Equals(req.Scenario, "storm", StringComparison.OrdinalIgnoreCase), reports, surface);
+    // Rainfall: an explicit amount (0-50 in), else the old scenario names (storm = 2.5 in).
+    double rain = req.RainInches is { } r && double.IsFinite(r)
+        ? Math.Round(Math.Clamp(r, 0, AreaService.MaxRainInches), 2)
+        : string.Equals(req.Scenario, "storm", StringComparison.OrdinalIgnoreCase) ? 2.5 : AreaService.NormalRainInches;
+    var opts = new AssessOptions(parcel, rain, reports, surface);
     // Both scenarios are computed: the AI judges them together, the response shows the requested one.
-    var normal = area.GetFeatures(a, lat, lng, snapped, opts with { Storm = false });
-    var storm = area.GetFeatures(a, lat, lng, snapped, opts with { Storm = true });
-    normal.CacheKey = storm.CacheKey = $"{normal.CacheKey}|{storm.CacheKey}";
-    var features = opts.Storm ? storm : normal;
+    // The AI judges the ordinary 1-inch rain and the chosen rainfall together; the response shows the chosen one.
+    var normal = area.GetFeatures(a, lat, lng, snapped, opts with { RainInches = AreaService.NormalRainInches });
+    var storm = rain == AreaService.NormalRainInches ? normal : area.GetFeatures(a, lat, lng, snapped, opts);
+    if (!ReferenceEquals(storm, normal)) normal.CacheKey = storm.CacheKey = $"{normal.CacheKey}|{storm.CacheKey}";
+    var features = storm;
     var flowPath = features.RoutePath;
     if (parcel is not null)
     {
-        foreach (var f in new[] { normal, storm })
+        foreach (var f in new[] { normal, storm }.Distinct())
         {
             f.Parcel = parcel;
             var home = f.Hotspots.First(h => h.Kind == "home");
@@ -220,7 +225,7 @@ app.MapPost("/api/assess", async (AreaService area, AiService ai, ParcelService 
         Location = doc.Location,
         Timestamp = doc.Timestamp,
         Features = features,   // always freshly computed (incl. low-spot outline)
-        Ai = aiResult.ForScenario(features.Scenario),
+        Ai = aiResult.ForRain(features.RainInches),
         FlowPath = flowPath,
     });
 }).RequireRateLimiting("expensive");

@@ -1,10 +1,12 @@
+using System.Globalization;
 using System.Collections.Concurrent;
 using FloodRisk.Api.Models;
 
 namespace FloodRisk.Api.Services;
 
 /// <summary>Per-request inputs that refine an assessment beyond the shared terrain grid.</summary>
-public sealed record AssessOptions(Parcel? Parcel = null, bool Storm = false, IReadOnlyList<WaterReport>? Reports = null, LotDrainage? Surface = null);
+/// <param name="RainInches">24-hour rainfall for the scenario, 0-50 inches (1 = an ordinary rain).</param>
+public sealed record AssessOptions(Parcel? Parcel = null, double RainInches = 1.0, IReadOnlyList<WaterReport>? Reports = null, LotDrainage? Surface = null);
 
 public sealed class AreaResult
 {
@@ -29,12 +31,33 @@ public sealed class AreaResult
 public sealed class AreaService
 {
     /// <summary>Bump when the scoring or features change, so stale cached assessments are not reused.</summary>
-    public const int AlgoVersion = 9;
+    public const int AlgoVersion = 11;
 
-    /// <summary>Rain depth per scenario, meters (1 in normal, 2.5 in heavy storm).</summary>
-    public const double NormalRainM = 0.0254, StormRainM = 0.0635;
-    /// <summary>Share of rain that runs off a typical suburban catchment (rest soaks in).</summary>
-    private const double RunoffCoefficient = 0.5;
+    /// <summary>The ordinary-rain baseline every assessment is also judged against, inches.</summary>
+    public const double NormalRainInches = 1.0;
+    public const double MaxRainInches = 50.0;
+
+    /// <summary>
+    /// Runoff depth (inches) from a 24-hour rain, by the NRCS/SCS Curve Number method. The curve number
+    /// blends pavement (CN 98) with suburban lawn on clay-loam soil (CN 74) by the paved share, so a
+    /// small rain mostly soaks in and a big storm runs off almost entirely.
+    /// </summary>
+    public static double RunoffInches(double rainInches, double imperviousPct)
+    {
+        double f = Math.Clamp(imperviousPct / 100.0, 0, 1);
+        double cn = 98 * f + 74 * (1 - f);
+        double s = 1000 / cn - 10, ia = 0.2 * s;
+        return rainInches <= ia ? 0 : (rainInches - ia) * (rainInches - ia) / (rainInches + 0.8 * s);
+    }
+
+    /// <summary>
+    /// How much a rainfall amount scales the terrain score: sqrt(inches) — 0 with no rain, 1 for an
+    /// ordinary inch, about 1.6 for a 2.5-inch storm, about 7 for 50 inches (capped at 100 overall).
+    /// </summary>
+    public static double RainFactor(double rainInches) => Math.Sqrt(Math.Clamp(rainInches, 0, MaxRainInches));
+
+    private static string RainLabel(double inches)
+        => inches == NormalRainInches ? "1-inch rain" : $"{inches.ToString("0.##", CultureInfo.InvariantCulture)}-inch storm";
     private const double ReportedPondRadiusM = 20;
     /// <summary>How far past the street we look for the pond its storm drains likely empty into.</summary>
     private const double OutfallSearchM = 400;
@@ -126,7 +149,7 @@ public sealed class AreaService
 
     /// <summary>Downhill runoff path from a point, stopping where it enters a low spot (or after ~800 m).</summary>
     public List<Coord> TraceFlowPath(AreaResult a, double lat, double lng, IReadOnlyList<WaterReport>? reports = null)
-        => FollowRunoff(a, lat, lng, ReportCells(a, reports), NormalRainM).Path;
+        => FollowRunoff(a, lat, lng, ReportCells(a, reports), NormalRainInches).Path;
 
     private const double RearPondSearchM = 200;
 
@@ -276,7 +299,7 @@ public sealed class AreaService
     /// beyond (often stale terrain under newer houses) no longer apply, and only a pond the drains likely
     /// empty into is reported.
     /// </summary>
-    private Runoff FollowRunoff(AreaResult a, double lat, double lng, Dictionary<(int, int), WaterReport> reported, double rainM)
+    private Runoff FollowRunoff(AreaResult a, double lat, double lng, Dictionary<(int, int), WaterReport> reported, double rainInches)
     {
         double cell = a.H.CellSizeM, dist = 0;
         var path = new List<Coord>();
@@ -308,8 +331,9 @@ public sealed class AreaService
             if (a.H.Depression[row, col] >= HydrologyService.PondThresholdM)
             {
                 var ls = DescribePond(a, row, col, dist);
-                // Will it overflow? Runoff volume from its whole catchment vs. the volume it can hold.
-                ls.InflowM3 = Math.Round(rainM * RunoffCoefficient * ls.CatchmentM2);
+                // Will it overflow? Curve-number runoff from its whole catchment vs. the volume it can hold.
+                double runoffM = RunoffInches(rainInches, CatchmentImpervious(a, row, col)) * 0.0254;
+                ls.InflowM3 = Math.Round(runoffM * ls.CatchmentM2);
                 ls.Overflows = ls.InflowM3 > ls.CapacityM3;
                 return Done(ls);
             }
@@ -371,7 +395,8 @@ public sealed class AreaService
             SnappedLng = snapped?.lng,
             // Filled in from the runoff route just below.
             AlgoVersion = AlgoVersion,
-            Scenario = opts.Storm ? "storm" : "normal",
+            Scenario = opts.RainInches == NormalRainInches ? "normal" : "storm",
+            RainInches = opts.RainInches,
         };
         f.Parcel = opts.Parcel;
         f.SurveyYear = a.SurveyYear;
@@ -381,7 +406,7 @@ public sealed class AreaService
             ? SurfaceRoute(a, lot, surf, reported)
             : f.TerrainPredatesHome
                 ? LotGradingRoute(a, opts.Parcel!, reported)
-                : FollowRunoff(a, lat, lng, reported, opts.Storm ? StormRainM : NormalRainM);
+                : FollowRunoff(a, lat, lng, reported, opts.RainInches);
         if (f.TerrainPredatesHome)
         {
             // A dip in the pre-construction ground is graded away under a newer home.
@@ -393,12 +418,13 @@ public sealed class AreaService
         f.StreetPathIndex = route.StreetIndex;
         f.RoutePath = route.Path;
         double baseRisk = HydrologyService.Score(f.FlowAccumulation, f.Slope, f.Depression, f.RelativeLow, f.Imperviousness);
-        // Heavy storm: same 1.6x the map uses, plus a bump when the low spot this property drains to overflows.
-        double risk = opts.Storm ? baseRisk * 1.6 : baseRisk;
+        // Scale by the rainfall (the map uses the same factor), plus a bump when the low spot this property
+        // drains to overflows.
+        double risk = baseRisk * RainFactor(opts.RainInches);
         if (f.LowSpot is { Overflows: true } ov) risk += ov.DistanceM <= 100 ? 10 : 4;
         f.DeterministicRisk = Math.Round(Math.Min(100, risk), 1);
         f.Observations = Observe(f);
-        f.CacheKey = $"{f.Scenario}|{StableHash(string.Join("|", f.Observations))}";
+        f.CacheKey = $"{f.RainInches.ToString("0.##", CultureInfo.InvariantCulture)}in|{StableHash(string.Join("|", f.Observations))}";
         f.Hotspots = Hotspots(a, f, row, col);
         return f;
     }
@@ -566,6 +592,17 @@ public sealed class AreaService
         => m2 >= 4046.86 ? $"{m2 / 4046.86:F1} acres" : $"{m2 * 10.7639:N0} sq ft";
 
     /// <summary>Follows runoff downhill and returns the first real low spot it pools in.</summary>
+    /// <summary>Average paved share around a low spot (~200 m), standing in for its catchment's paving.</summary>
+    private static double CatchmentImpervious(AreaResult a, int row, int col)
+    {
+        int rad = Math.Max(2, (int)Math.Round(200 / a.H.CellSizeM));
+        double sum = 0; int n = 0;
+        for (int r = Math.Max(0, row - rad); r <= Math.Min(a.Rows - 1, row + rad); r++)
+        for (int c = Math.Max(0, col - rad); c <= Math.Min(a.Cols - 1, col + rad); c++)
+        { sum += a.H.Impervious[r, c]; n++; }
+        return n == 0 ? 0 : sum / n;
+    }
+
     private static LowSpot DescribeReport(AreaResult a, WaterReport rep, Dictionary<(int, int), WaterReport> reported, double distM)
     {
         var cells = reported.Where(kv => kv.Value.Id == rep.Id).Select(kv => CellCenter(a, kv.Key.Item1, kv.Key.Item2)).ToList();
@@ -683,7 +720,16 @@ public sealed class AreaService
         else if (f.UpstreamAreaM2 >= 2_000) o.Add($"Concern: runoff from about {f.UpstreamAreaM2:N0} m² of land uphill drains through this spot");
         else o.Add("In its favor: very little water drains in from uphill");
 
-        string rain = f.Scenario == "storm" ? "2.5-inch storm" : "1-inch rain";
+        string rain = RainLabel(f.RainInches);
+        if (f.RainInches > 0)
+        {
+            double runoff = RunoffInches(f.RainInches, f.Imperviousness);
+            double share = runoff / f.RainInches * 100;
+            string tag = f.RainInches >= 6 || share >= 50 ? "Concern" : "Info";
+            o.Add(f.RainInches >= 6
+                ? $"{tag}: with {f.RainInches:0.##} inches of rain the ground saturates and about {share:F0}% runs off this lot ({runoff:0.#} inches of water) — yards, streets and storm drains everywhere overflow at this amount"
+                : $"{tag}: in a {rain} about {share:F0}% of the water runs off this lot ({runoff:0.##} inches) and the rest soaks in");
+        }
         if (f.Surface is { } sf)
             o.Add($"Info: on the current aerial surface ({sf.ImageryDate}), about {sf.FrontSharePct:F0}% of the lot drains toward the street and {sf.BackSharePct:F0}% toward the back");
         else if (f.TerrainPredatesHome)
