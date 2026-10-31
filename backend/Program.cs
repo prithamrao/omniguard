@@ -9,12 +9,14 @@ var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddCors(o => o.AddDefaultPolicy(p =>
     p.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod()));
+builder.Services.AddResponseCompression(o => o.EnableForHttps = true);   // map outlines are large, mostly repeated JSON
 
 builder.Services.AddHttpClient<AiService>();
 builder.Services.AddHttpClient<GeocodingService>();
 builder.Services.AddHttpClient<ParcelService>();
 builder.Services.AddHttpClient<SolarSurfaceService>();
 builder.Services.AddHttpClient<TapWaterService>();
+builder.Services.AddHttpClient<HazardsService>();
 builder.Services.AddSingleton<HttpClient>();
 builder.Services.AddSingleton<DemService>();
 builder.Services.AddSingleton<ImperviousService>();
@@ -61,6 +63,7 @@ builder.Services.AddRateLimiter(o =>
 
 var app = builder.Build();
 app.UseForwardedHeaders();
+app.UseResponseCompression();
 app.UseCors();
 app.UseRateLimiter();
 
@@ -233,6 +236,10 @@ app.MapPost("/api/assess", async (AreaService area, AiService ai, ParcelService 
 // Tap-water quality for the public water system serving a point (EPA boundaries, SDWIS, ECHO).
 app.MapGet("/api/tapwater", async (TapWaterService tap, double lat, double lng, CancellationToken ct) =>
     Results.Ok(await tap.GetAsync(lat, lng, ct)));
+
+// Air quality, FEMA flood zone, fire perimeters, shelters and hospitals around a point.
+app.MapGet("/api/hazards", async (HazardsService hazards, double lat, double lng, CancellationToken ct) =>
+    Results.Ok(await hazards.GetAsync(lat, lng, ct)));
 
 // Resident reports: ponds / storm drains newer than the elevation survey and map data.
 app.MapGet("/api/reports/near", async (AssessmentRepository repo, double lat, double lng, double radius = 2000) =>
