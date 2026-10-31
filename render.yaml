@@ -1,0 +1,50 @@
+# Render Blueprint — Stormwater Flood-Risk API
+#
+# Git-backed Docker build. The frontend (Vite) deploys separately to Vercel and calls
+# this API cross-origin, so CORS is open (no auth on this demo API).
+#
+# Secrets (AI__ApiKey, MongoDb__ConnectionString, Geoapify__ApiKey, ReportAll__ClientKey, GoogleSolar__ApiKey, Turnstile__*, Session__SigningKey) are intentionally NOT declared here —
+# set them once per service in the Render dashboard (env vars set there win).
+#
+# Usage:
+#   1. Render Dashboard -> New -> Blueprint -> choose this repo.
+#   2. Set AI__ApiKey, MongoDb__ConnectionString, Geoapify__ApiKey and ReportAll__ClientKey
+#      in the service's Environment tab.
+services:
+  - type: web
+    name: flood-risk-api
+    runtime: docker
+    dockerfilePath: backend/Dockerfile
+    dockerContext: .
+    region: oregon
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: ASPNETCORE_ENVIRONMENT
+        value: Production
+      - key: ASPNETCORE_URLS
+        value: http://+:10000
+      - key: AI__BaseUrl
+        value: https://api.groq.com/openai/v1
+      - key: AI__Model
+        value: openai/gpt-oss-120b
+      - key: MongoDb__DatabaseName
+        value: floodrisk
+      - key: AI__ApiKey
+        sync: false
+      - key: MongoDb__ConnectionString
+        sync: false
+      - key: Geoapify__ApiKey
+        sync: false
+      - key: ReportAll__ClientKey
+        sync: false
+      - key: GoogleSolar__ApiKey
+        sync: false
+      - key: HumanCheck__Mode
+        value: code
+      - key: Turnstile__SiteKey
+        sync: false
+      - key: Turnstile__SecretKey
+        sync: false
+      - key: Session__SigningKey
+        sync: false

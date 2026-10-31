@@ -1,0 +1,31 @@
+<Project>
+  <PropertyGroup>
+    <Configurations>Debug;Release;Test</Configurations>
+    <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
+    <Platforms>AnyCPU;x64</Platforms>
+    <Platform Condition="'$(Platform)' == ''">AnyCPU</Platform>
+    <OutputPath>bin\$(Platform)\$(Configuration)\</OutputPath>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <WarningsNotAsErrors>NU1901;NU1902;NU1903;CS0618;CS8618;CS8601;CS8619;CS8604</WarningsNotAsErrors>
+    <DebugType>Portable</DebugType>
+    <ProduceReferenceAssembly>true</ProduceReferenceAssembly>
+    <RestorePackagesWithLockFile>false</RestorePackagesWithLockFile>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)' == 'Debug'">
+    <DebugSymbols>true</DebugSymbols>
+    <DefineConstants>DEBUG;TRACE;DEVELOPMENT</DefineConstants>
+    <EnvironmentName>Development</EnvironmentName>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <Optimize>true</Optimize>
+    <EnvironmentName>Production</EnvironmentName>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)' == 'Test'">
+    <DebugSymbols>true</DebugSymbols>
+    <DefineConstants>DEBUG;TRACE;TEST</DefineConstants>
+    <EnvironmentName>Test</EnvironmentName>
+  </PropertyGroup>
+</Project>

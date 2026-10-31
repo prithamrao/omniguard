@@ -1,0 +1,138 @@
+STORMWATER FLOOD-RISK MAP — PROMPTS TO BUILD THE APP FROM SCRATCH
+=================================================================
+
+How to use:
+- Open Claude Code in an empty folder.
+- Paste ONE prompt per message, in order. Let each finish and work before sending the next.
+- Put your keys in the .env file yourself. Never paste keys into chat.
+- Keys you need: Groq, Geoapify, ReportAll, Google Solar API.
+- The code won't be byte-identical to the original (AI output varies), but these
+  prompts reproduce the same features and avoid every bug we hit.
+
+
+-----------------------------------------------------------------
+PROMPT 1 — The idea and the skeleton
+-----------------------------------------------------------------
+I want to build a "Stormwater Flood-Risk Map": a homeowner searches a US address and sees their exact property lot, where the rain that falls on it goes (front yard vs back yard), what floods in a heavy storm, and plain-language fixes — plus a 0-100 risk score from a terrain formula and an independent AI "second opinion".
+
+Set up the project:
+- Backend: .NET 10 minimal API in backend/ (project FloodRisk.Api), central package management (Directory.Packages.props with MongoDB.Driver), Directory.Build.props with TreatWarningsAsErrors, multi-stage non-root Dockerfile on port 8080 with a /health curl healthcheck.
+- Frontend: React 18 + Vite + MapLibre GL in frontend/. Left floating panel: title, search box with Go and Clear buttons, basemap buttons (Streets/Light/Dark from OpenFreeMap, Satellite from Esri World Imagery as the default), a 3D terrain toggle (AWS terrarium tiles), "Normal rain" / "Heavy storm (2.5 in)" buttons, and a Low/Moderate/High/Severe legend with an info tooltip. Vite proxies /api to process.env.API_PROXY or http://localhost:5000.
+- docker-compose.yml with profiles: core (mongo:8 on host port 27018) and api (API on host port 5000), passing keys from a gitignored root .env: AI__ApiKey=${GROQ_API_KEY}, Geoapify__ApiKey=${GEOAPIFY_KEY}, ReportAll__ClientKey=${REPORTALL_CLIENT_KEY}, GoogleSolar__ApiKey=${GOOGLE_SOLAR_KEY}.
+- .env.example, render.yaml (secrets as sync:false), README.
+- MongoDB must fail soft: the app keeps working if Mongo is down.
+Don't ask me to paste keys in chat; I'll fill .env myself.
+
+
+-----------------------------------------------------------------
+PROMPT 2 — Terrain and hydrology
+-----------------------------------------------------------------
+Add terrain and hydrology, written in our own C# (no GIS libraries).
+
+DemService: fetch an 8 km square of elevation around a point. US: USGS 3DEP ImageServer exportImage as a float32 GeoTIFF, 600x600 (~13 m cells), parsed with a small TIFF reader. Elsewhere: AWS terrarium tiles. Center every area on a FIXED tile (round lat/lng to 0.02 degrees), never on the clicked point, and cache areas with Lazy<Task> so concurrent requests share one fetch — the same house must always get the same numbers no matter what was clicked before.
+
+HydrologyService:
+- priority-flood depression filling (Barnes 2014, epsilon 1e-4)
+- D8 flow directions on the filled surface; flow accumulation by processing cells high to low
+- slope in percent on the real surface using the true cell size in meters
+- ponding depth = filled minus original (ignore under 1 cm)
+- "relative low" = 15x15 neighborhood mean minus elevation (summed-area table)
+- risk 0-100 on FIXED physical scales (never per-area min/max): log(accumulation)/log(2000); flatness (0% slope = 1, 5% or more = 0); ponding saturating at 0.5 m; relative lowness saturating at 1.5 m; paved %. Weights: 0.30 accumulation, 0.20 flatness, 0.25 max(pond,low) + 0.10 min(pond,low), 0.15 paved.
+When stepping downhill along a flow path, read both the row AND column direction from the current cell before moving.
+
+Endpoints: GET /api/map/area (risk points every 4th cell for the map) and show them as small colored dots, green below 25, yellow, orange, red above 75.
+
+
+-----------------------------------------------------------------
+PROMPT 3 — Map data (roads, water, buildings)
+-----------------------------------------------------------------
+Add ImperviousService that reads OpenFreeMap vector tiles at zoom 14 with a minimal Mapbox Vector Tile protobuf decoder (no library). Extract: landuse polygons (residential/commercial/industrial/retail/school), housenumber points with their housenumber tag, transportation lines with their class, and water polygons. Rasterize onto the same grid as the elevation: a paved % grid (built-up landuse 55%, roads and building points 95%), a water mask, and a street mask using only classes motorway, trunk, primary, secondary, tertiary, minor (NOT service — those are driveways and parking aisles). Keep the street centerlines as vectors too.
+Decode multi-part geometries part by part — a new part starts at every MoveTo. Never join parts end to end, or you create fake road segments cutting across back yards.
+
+
+-----------------------------------------------------------------
+PROMPT 4 — Finding the exact house
+-----------------------------------------------------------------
+Add address search that lands on the right house.
+- /api/geocode: Geoapify search first (only accept result_type building or amenity), then the US Census geocoder, then Photon. Always return the house number.
+- /api/suggest: Geoapify autocomplete (US only) with a dropdown that works by keyboard (arrow keys, Enter, Escape). Picking a suggestion must call /api/geocode with its full label, so typing and picking always give identical coordinates. Clear the pending autocomplete timer on submit so the dropdown doesn't reopen.
+- ParcelService using ReportAll's /api/parcels (client key, v=9, spatial_intersect as WKT, si_srid=4326, lot shape from geom_as_wkt): for a search, find the lot whose address has the SAME house number and street, widening step by step (the point itself, 80 m, 250 m) so ReportAll's per-page limit never cuts the right lot off; for a map click, use the lot under the cursor. Return address, outline, centroid, year_built, bldg_sqft, land_cover. Cache lookups in memory, then Mongo (including "no lot here"), with a versioned cache key.
+Free geocoders space house numbers evenly along the street and often land on the neighbor — the parcel match is what fixes that. If no lot is found, mark the location "approximate" and tell the user to click their roof.
+
+
+-----------------------------------------------------------------
+PROMPT 5 — The assessment and the AI
+-----------------------------------------------------------------
+Add POST /api/assess:
+1. Find the lot; assess at its centroid (else the geocoded point).
+2. Paved % per lot = the larger of (bldg_sqft / 1.6 + 500 sq ft driveway) / lot area, and the NLCD land-cover mix (High 90, Medium 65, Low 35, Open Space 10). Record which source was used.
+3. Compute BOTH scenarios: normal (1 inch) and heavy storm (2.5 inch). Storm terrain score = 1.6x normal plus a bump if the low spot overflows. For a dry low spot, compare runoff = rain x 0.5 x its catchment area with the volume it holds = sum of its ponding depths x cell area; it overflows when runoff is larger.
+4. Write plain-language observations, each tagged "Concern:", "In its favor:" or "Info:".
+5. AI second opinion via Groq (OpenAI-compatible, model openai/gpt-oss-120b, temperature 0, seed 42, response_format json_object), ONE call judging both scenarios, returning riskScore, stormRiskScore (code enforces storm >= normal), stormNote, summary, issues (semicolons) and recommendation. The AI must NEVER see our formula's score (or it just copies it), may list only Concern facts as issues, and must not use the words impervious, depression or flow accumulation. Category comes from the score: 0-24 Low, 25-49 Moderate, 50-74 High, 75+ Severe.
+6. Cache the AI answer by grid cell + a stable FNV hash of the facts (not string.GetHashCode — it changes every run), in memory and Mongo, so revisiting a house returns the identical record and new facts trigger a fresh answer. If the AI fails, still return the terrain result.
+
+
+-----------------------------------------------------------------
+PROMPT 6 — Where the water goes
+-----------------------------------------------------------------
+Add runoff routing that matches real neighborhoods:
+1. Default: follow runoff downhill. Before it reaches a street it can stop at a resident-reported pond/drain, a mapped water body, or a dip at least 0.15 m deep. Once it reaches a street, curbs and gutters take it to the storm drains: ignore dips past the street, but if a pond lies within 400 m beyond it, show it as the likely storm-drain outfall (drawn dotted, labeled approximate).
+2. Stale terrain: get the newest public survey year from the USGS TNM Access products API (1 m DEMs and lidar point clouds; year parsed from the project name) plus the 3DEP lidar index, take the newest. If the home's year_built is newer, the survey shows the land before grading — route by lot grading instead: roof and front yard to the nearest point on a street centerline, back yard to the nearest pond within 200 m.
+3. Best case — current aerial surface: with a Google Solar API key call dataLayers:get (view=DSM_LAYER, radius 100 m, pixelSizeMeters 0.5, requiredQuality LOW), download the DSM GeoTIFF (Deflate-compressed, tiled, float32, big-endian, UTM via ModelTransformation, EPSG from GeoKey 3072; write our own UTM forward/inverse). Smooth with a 3-pixel box, fill pits, sample the lot every 2 m, trace each sample until it leaves the lot, and classify the exit as front or back by its direction relative to the street. Report "X% drains to the front, Y% to the back", both paths (trim the front path where it is closest to the street), and follow the back path to a pond on it or within 40 m of its end.
+
+
+-----------------------------------------------------------------
+PROMPT 7 — The map and the panel
+-----------------------------------------------------------------
+Build the results UI.
+Map:
+- One pin per issue at its real location (house — red if it has problems, street, low spot/pond, back-yard end, uphill inflow). Hovering a pin shows a card listing that spot's issues in plain words with a fix. Put the teardrop rotation on an inner element (MapLibre controls the marker's own transform).
+- Lot outline in yellow over a dark casing; front path cyan dashes; back path blue dashes; storm-drain continuation light dotted; low-spot/pond area as a fill with no per-cell outlines, turning red and pulsing when it overflows.
+- After a search, fit the map to the house and its pins (street level).
+Panel:
+- Official lot address as the title ("Common area" when the house number is 0)
+- Badges: "Heavy storm scenario · 2.5 in", "Aerial surface YYYY-MM (lot graded, before the home was built) · public survey YYYY", "Matched to the official property lot" or "Approximate location"
+- Two score cards, "Terrain model" and "AI engineer", each with a category word (never color alone)
+- AI summary, storm note, issues as bullets, "What to do"
+- "Where your water goes": a front/back share bar and one line each, with a "Show pond" button
+- Chips: elevation, slope %, uphill area (sq ft or acres), paved % with its source, height vs neighbors
+Switching Normal rain / Heavy storm re-assesses the current property.
+
+
+-----------------------------------------------------------------
+PROMPT 8 — Resident reports
+-----------------------------------------------------------------
+Add "Missing on the map? + Pond / + Storm drain". Clicking a button turns on placement; the next map click saves the report (POST /api/reports, Mongo with an in-memory fallback; GET /api/reports/near; DELETE /api/reports/{id}). Show reports as square pins whose popup has a Remove button — stop the click from reaching the map AND toggle the popup yourself. Reports feed the runoff routing (a pond covers 20 m around its pin, a drain its cell and neighbors), and adding or removing one re-assesses the property.
+
+
+-----------------------------------------------------------------
+PROMPT 9 — Test everything end to end
+-----------------------------------------------------------------
+Run the whole app locally and test it in the browser with two real US home addresses (ideally one built in the last few years). For each: search by picking the autocomplete suggestion, click three other houses, then search the original by typing it — the panel must be identical field for field. Toggle Heavy storm: both scores must rise and a storm note appear. Add a storm drain on the street and remove it: the route must change, then revert exactly. Check the street pin sits on the road outside the lot and no runoff path crosses a neighbor's lot. Fix anything that fails and show me screenshots.
+
+
+-----------------------------------------------------------------
+PROMPT 10 — Tap-water contamination tab (feature branch)
+-----------------------------------------------------------------
+Create a feature branch feature/tap-water-quality and add tap-water quality for the searched address, using only public EPA data (no API keys).
+
+Backend — TapWaterService + GET /api/tapwater?lat&lng:
+1. Which water system serves the address: query EPA's Community Water System Service Area Boundaries (ArcGIS FeatureServer at services.arcgis.com/cJ9YHowT8TU7DUyn/.../Water_System_Boundaries/FeatureServer/0) with the lot's centroid. If the point is outside every boundary, take the largest system within 2 km and label it "nearest system — confirm with your water bill". If nothing within 2 km: "likely a private well" plus advice to test the well yearly for bacteria and nitrate.
+2. Violation history: EPA Envirofacts SDWIS (data.epa.gov/efservice/VIOLATION/PWSID/{pwsid}/JSON). Keep health-based violations from the last 10 years; count non-health-based ones from the last 5 years separately as "testing or reporting lapses — paperwork, not contamination". A violation is resolved when it has an rtc_date or status "R".
+3. Names and metals: EPA ECHO detailed facility report (echodata.epa.gov/echo/dfr_rest_services.get_dfr?p_id={pwsid}&p_system=SDWIS&output=JSON). Use its ContaminantName by violation id; learn contaminant code → name from those matches and reuse it for older violations with the same code; otherwise use a short list of codes we're certain of, else show "Contaminant code X". Take the latest lead and copper 90th-percentile results and compare them with EPA's action levels (lead 15 ppb, copper 1,300 ppb). Show the SDWIS data date.
+4. Group identical violations (same contaminant, kind, period, resolution) into one line with a count. Plain-language kinds: MCL "exceeded a legal limit", TT "missed a required treatment step", MR "missed or late testing or reporting".
+5. Level: "alert" if any violation is unresolved or lead/copper is over the action level; "watch" if there were health-based violations, all resolved; else "good". Headline in one plain sentence. Always add a note that the utility's record doesn't cover lead from pipes inside the home (point to the utility's annual Consumer Confidence Report) and link EPA's full report. Turn names like "FUQUAY-VARINA, TOWN OF" into "Town of Fuquay-Varina". Cache per water system for 24 hours; never cache a failed lookup.
+
+Frontend:
+- Under the address title and lot-match line, add accessible tabs "🌊 Flood risk" and "🚰 Tap water" (role tablist/tab/tabpanel, aria-selected, arrow keys/Home/End move between tabs). The flood content moves into the first tab unchanged.
+- Fetch tap water as soon as a property loads (keyed by its location) so switching tabs is instant; show a colored dot on the Tap water tab with its meaning as the label (never color alone).
+- Tap water tab: headline box (green/yellow/red with ✅/ℹ️/⚠️ and a word), water system name, ID and people served, lead/copper bars against the action level with the number and "Below detection" when 0, the violation list with Resolved/Not resolved, the notes, the EPA report link, and the data source and date.
+- Also drop stale autocomplete replies so the suggestion list never reopens after a search.
+
+Test with two real US home addresses served by different town water systems, plus one rural address (expect the private-well message); compare the system name, any resolved violations and the lead result with EPA's own facility report. Then commit to the feature branch.
+
+
+-----------------------------------------------------------------
+PROMPT 11 — Publish safely
+-----------------------------------------------------------------
+Before I make this public: scan the files and the entire git history for API keys and personal details (test addresses in comments included) and fix anything found. Then create a new public GitHub repo with a single clean commit.

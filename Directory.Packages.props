@@ -1,0 +1,10 @@
+<Project>
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <CentralPackageTransitivePinningEnabled>true</CentralPackageTransitivePinningEnabled>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageVersion Include="MongoDB.Driver" Version="3.11.1" />
+    <PackageVersion Include="StbImageSharp" Version="2.27.13" />
+  </ItemGroup>
+</Project>
