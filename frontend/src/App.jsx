@@ -3,9 +3,12 @@ import maplibregl from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
 
 import { API_BASE, apiFetch } from './api.js'
+import { CompoundBanner, HazardCards } from './HazardCards.jsx'
+import { airScore, categoryFor, compound, fireScore, floodScore, fmtMi, waterScore } from './hazards.js'
 
 // Rainfall: "Normal rain" is always 1 inch; "Heavy storm" takes any 0-50 inch amount.
 const NORMAL_RAIN_IN = 1
+const DEFAULT_STORM_IN = 2.5   // the app opens on this storm
 const MAX_RAIN_IN = 50
 // Same factor the server uses to scale risk with rainfall: sqrt(inches).
 const rainFactor = (inches) => Math.sqrt(Math.min(Math.max(inches, 0), MAX_RAIN_IN))
@@ -54,11 +57,16 @@ function riskColorExpr(m) {
     80, '#d73027',
     100, '#7f0000']
 }
-// Same scale the AI is told to use.
-function categoryFor(score) {
-  return score >= 75 ? 'Severe' : score >= 50 ? 'High' : score >= 25 ? 'Moderate' : 'Low'
-}
-const CATEGORY_COLORS = { Low: '#27ae60', Moderate: '#d4a106', High: '#e67e22', Severe: '#c0392b' }
+// Dark enough to read as small text on the light score cards.
+const CATEGORY_COLORS = { Low: '#1e7a46', Moderate: '#7a5a00', High: '#a84e08', Severe: '#b03a2e' }
+
+// Sidebar checkboxes for the map layers.
+const LAYER_FILTERS = [
+  { id: 'flood', label: 'Flood layers (risk dots, runoff, lot)' },
+  { id: 'fema', label: 'FEMA flood zones' },
+  { id: 'fire', label: 'Fire perimeters' },
+  { id: 'places', label: 'Shelters & hospitals' },
+]
 
 // Each low-spot cell as a small square, so the pond reads as an area, not a dot.
 function pondFC(lowSpot, cellDeg) {
@@ -123,9 +131,33 @@ function hotspotMarker(m, h, flagged) {
   const popup = new maplibregl.Popup({ closeButton: false, closeOnClick: false, offset: [0, -32], maxWidth: '280px', className: 'hotspot-popup' })
     .setHTML(`<b>${escapeHtml(h.title)}</b><ul>${h.details.map((d) => `<li>${escapeHtml(d)}</li>`).join('')}</ul>`)
   const marker = new maplibregl.Marker({ element: el, anchor: 'bottom' }).setLngLat([h.lng, h.lat]).setPopup(popup).addTo(m)
-  el.addEventListener('mouseenter', () => { if (!popup.isOpen()) marker.togglePopup() })
-  el.addEventListener('mouseleave', () => { if (popup.isOpen()) marker.togglePopup() })
+  describePin(el, marker, popup, h.title)
+  return marker
+}
+
+// Shared pin behavior: a name for screen readers, and the popup on hover, keyboard focus or tap.
+function describePin(el, marker, popup, label) {
+  el.setAttribute('role', 'img')
+  el.setAttribute('aria-label', label)
+  el.tabIndex = 0
+  const show = () => { if (!popup.isOpen()) marker.togglePopup() }
+  const hide = () => { if (popup.isOpen()) marker.togglePopup() }
+  el.addEventListener('mouseenter', show)
+  el.addEventListener('mouseleave', hide)
+  el.addEventListener('focus', show)
+  el.addEventListener('blur', hide)
   el.addEventListener('click', (e) => e.stopPropagation())
+}
+
+// A shelter or hospital pin. The letter and shape, not just the color, tell them apart.
+function facilityMarker(m, f) {
+  const el = document.createElement('div')
+  el.className = `facility-pin facility-${f.kind}`
+  el.textContent = f.kind === 'hospital' ? 'H' : 'S'
+  const popup = new maplibregl.Popup({ closeButton: false, closeOnClick: false, offset: 16, maxWidth: '260px', className: 'hotspot-popup' })
+    .setHTML(`<b>${escapeHtml(f.name)}</b>${escapeHtml(f.address)}<br/>${escapeHtml(fmtMi(f.distanceKm))} away · ${escapeHtml(f.detail)}`)
+  const marker = new maplibregl.Marker({ element: el }).setLngLat([f.lng, f.lat]).setPopup(popup).addTo(m)
+  describePin(el, marker, popup, `${f.kind === 'hospital' ? 'Hospital' : 'Shelter'}: ${f.name}, ${fmtMi(f.distanceKm)} away`)
   return marker
 }
 
@@ -169,14 +201,17 @@ function historyFC(history) {
 export default function App() {
   const mapEl = useRef(null)
   const map = useRef(null)
-  const data = useRef({ points: [], flowPath: [], streetIndex: null, surface: null, history: [], lowSpot: null, hotspots: [], parcel: null, reports: [], cellDeg: 0.00012 })
+  const data = useRef({ points: [], flowPath: [], streetIndex: null, surface: null, history: [], lowSpot: null, hotspots: [], parcel: null, reports: [], cellDeg: 0.00012, hazards: null })
   const markers = useRef([])
   const reportMarkers = useRef([])
-  const rainRef = useRef(NORMAL_RAIN_IN)   // rainfall (inches) the property on screen is assessed for
+  const facilityMarkers = useRef([])
+  const layersRef = useRef({ flood: true, fema: true, fire: true, places: true })
+  const rainRef = useRef(DEFAULT_STORM_IN)   // rainfall (inches) the property on screen is assessed for
   const lastReq = useRef(null)          // the property on screen, so a scenario switch or new report re-assesses it
+  const assessSeq = useRef(0)           // bumps on every assessment; a late reply to an older one is dropped
   const reportModeRef = useRef(null)    // 'pond' | 'drain' while placing a report
   const pulseRef = useRef(null)
-  const mult = useRef(1)
+  const mult = useRef(rainFactor(DEFAULT_STORM_IN))
   const selectRef = useRef(() => {})
   const terrain3dRef = useRef(false)
   const riskShown = useRef(false)
@@ -188,9 +223,9 @@ export default function App() {
 
   const [basemap, setBasemap] = useState('satellite')
   const [terrain3d, setTerrain3d] = useState(false)
-  const [scenario, setScenario] = useState('normal')
-  const [stormInput, setStormInput] = useState('2.5')     // what's typed in the storm box
-  const [stormInches, setStormInches] = useState(2.5)     // the last valid storm amount
+  const [scenario, setScenario] = useState('storm')
+  const [stormInput, setStormInput] = useState(String(DEFAULT_STORM_IN))   // what's typed in the storm box
+  const [stormInches, setStormInches] = useState(DEFAULT_STORM_IN)         // the last valid storm amount
   const [rainError, setRainError] = useState(null)
   const [selected, setSelected] = useState(null)
   const [loading, setLoading] = useState(false)
@@ -203,14 +238,36 @@ export default function App() {
   const [reportMode, setReportMode] = useState(null)
   const [tab, setTab] = useState('flood')
   const [tap, setTap] = useState({ key: null, data: null, loading: false })
+  const [hazards, setHazards] = useState({ key: null, data: null, loading: false })
+  const [layers, setLayers] = useState(layersRef.current)
+  const [controlsOpen, setControlsOpen] = useState(false)   // phone only; the sidebar is always open on desktop
 
   function applyOverlays() {
     const m = map.current
     if (!m) return
-    ;['risk-layer', 'parcel-casing', 'parcel-line', 'pond-fill', 'inflow-layer', 'rear-layer', 'flow-layer', 'sewer-layer', 'history-layer'].forEach((id) => { if (m.getLayer(id)) m.removeLayer(id) })
-    ;['risk-src', 'parcel-src', 'pond-src', 'inflow-src', 'rear-src', 'flow-src', 'sewer-src', 'history-src'].forEach((id) => { if (m.getSource(id)) m.removeSource(id) })
+    ;['fema-fill', 'fema-line', 'fire-fill', 'fire-line', 'risk-layer', 'parcel-casing', 'parcel-line', 'pond-fill', 'inflow-layer', 'rear-layer', 'flow-layer', 'sewer-layer', 'history-layer'].forEach((id) => { if (m.getLayer(id)) m.removeLayer(id) })
+    ;['fema-src', 'fire-src', 'risk-src', 'parcel-src', 'pond-src', 'inflow-src', 'rear-src', 'flow-src', 'sewer-src', 'history-src'].forEach((id) => { if (m.getSource(id)) m.removeSource(id) })
+    clearInterval(pulseRef.current)
 
     const d = data.current
+    const show = layersRef.current
+    // Zones and perimeters go in first, so the flood layers draw on top of them.
+    const zones = d.hazards?.floodZone?.overlay
+    if (show.fema && zones?.features?.length) {
+      m.addSource('fema-src', { type: 'geojson', data: zones })
+      const high = ['==', ['get', 'SFHA_TF'], 'T']
+      m.addLayer({ id: 'fema-fill', type: 'fill', source: 'fema-src', paint: { 'fill-color': '#1e6edc', 'fill-opacity': ['case', high, 0.4, 0.08] } })
+      m.addLayer({ id: 'fema-line', type: 'line', source: 'fema-src', paint: { 'line-color': '#1560bd', 'line-width': ['case', high, 1.5, 0.6], 'line-opacity': 0.8 } })
+    }
+    const fires = d.hazards?.fire?.overlay
+    if (show.fire && fires?.features?.length) {
+      const active = ['==', ['get', 'active'], true]
+      m.addSource('fire-src', { type: 'geojson', data: fires })
+      m.addLayer({ id: 'fire-fill', type: 'fill', source: 'fire-src', paint: { 'fill-color': '#e0201b', 'fill-opacity': ['case', active, 0.1, 0.16] } })
+      m.addLayer({ id: 'fire-line', type: 'line', source: 'fire-src', paint: { 'line-color': '#e0201b', 'line-width': ['case', active, 3, 0.8], 'line-opacity': ['case', active, 1, 0.5] } })
+    }
+    if (!show.flood) { updateMarkers(); return }
+
     if (d.points.length && riskShown.current) {
       m.addSource('risk-src', { type: 'geojson', data: pointsFC(d.points) })
       m.addLayer({
@@ -231,7 +288,6 @@ export default function App() {
       m.addLayer({ id: 'parcel-casing', type: 'line', source: 'parcel-src', paint: { 'line-color': '#1b1b1b', 'line-width': 5, 'line-opacity': 0.55 } })
       m.addLayer({ id: 'parcel-line', type: 'line', source: 'parcel-src', paint: { 'line-color': '#ffd400', 'line-width': 2.5 } })
     }
-    clearInterval(pulseRef.current)
     if (d.lowSpot?.cells?.length) {
       const overflow = d.lowSpot.overflows
       m.addSource('pond-src', { type: 'geojson', data: pondFC(d.lowSpot, d.cellDeg) })
@@ -304,9 +360,13 @@ export default function App() {
     if (!m) return
     reportMarkers.current.forEach((mk) => mk.remove())
     reportMarkers.current = data.current.reports.map((r) => reportMarker(m, r, removeReport))
+    facilityMarkers.current.forEach((mk) => mk.remove())
+    const h = data.current.hazards
+    facilityMarkers.current = layersRef.current.places && h ? [...h.shelters, ...h.hospitals].map((f) => facilityMarker(m, f)) : []
     markers.current.forEach((mk) => mk.remove())
     markers.current = []
-    const spots = data.current.hotspots
+    // The house pin stays when the flood layers are off, so the address remains marked.
+    const spots = data.current.hotspots.filter((s) => layersRef.current.flood || s.kind === 'home')
     if (spots.length) {
       const flagged = (h) => h.kind !== 'home' || !h.details[0]?.startsWith('No significant')
       // Draw the house last so it sits on top when pins overlap.
@@ -331,6 +391,7 @@ export default function App() {
 
   async function handleSelect(lat, lng, houseNumber = null, street = null) {
     lastReq.current = { lat, lng, houseNumber, street }
+    const seq = ++assessSeq.current     // a newer click or rain change makes this request stale
     setLoading(true)
     setError(null)
     riskShown.current = true
@@ -348,6 +409,7 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ lat, lng, houseNumber, street, rainInches: rainRef.current }),
       }).then((r) => r.json())
+      if (seq !== assessSeq.current) return null
       if (assessRes.error) {
         setError(assessRes.error)
       } else {
@@ -368,10 +430,10 @@ export default function App() {
       applyOverlays()
       return assessRes
     } catch (e) {
-      setError('Assessment failed — is the API running?')
+      if (seq === assessSeq.current) setError('Assessment failed — is the API running?')
       console.error(e)
     } finally {
-      setLoading(false)
+      if (seq === assessSeq.current) setLoading(false)
     }
   }
   // Map clicks place a report while report mode is on; otherwise they assess the clicked spot.
@@ -437,10 +499,19 @@ export default function App() {
     const pts = (res?.features?.hotspots || []).map((h) => [h.lng, h.lat])
     if (m && pts.length > 1) {
       const b = pts.reduce((bb, p) => bb.extend(p), new maplibregl.LngLatBounds(pts[0], pts[0]))
-      const panel = window.innerWidth > 700 ? 360 : 0
-      m.fitBounds(b, { padding: { top: 80, bottom: 80, left: panel + 60, right: 80 }, maxZoom: 18, minZoom: 15, duration: 600 })
+      m.fitBounds(b, { padding: 70, maxZoom: 18, minZoom: 15, duration: 600 })
     }
     return true
+  }
+
+  // Zoom out just enough to show the house and a shelter or hospital picked from its card.
+  function showFacility(f) {
+    const m = map.current
+    const home = selectedLoc.current
+    if (!m || !home) return
+    if (!layersRef.current.places) setLayers((l) => ({ ...l, places: true }))
+    m.fitBounds(new maplibregl.LngLatBounds([f.lng, f.lat], [f.lng, f.lat]).extend([home.lng, home.lat]), { padding: 70, maxZoom: 16, duration: 600 })
+    document.querySelector('.map-wrap')?.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
   }
 
   async function runSearch(qText, fallbackLat, fallbackLng) {
@@ -536,7 +607,10 @@ export default function App() {
     data.current.hotspots = []
     data.current.parcel = null
     data.current.reports = []
+    data.current.hazards = null
     lastReq.current = null
+    assessSeq.current++
+    setLoading(false)
     setReporting(null)
     riskShown.current = false
     selectedLoc.current = null
@@ -558,6 +632,15 @@ export default function App() {
 
     // Hover tooltip on risk dots (and low spots) — shows what the spot means.
     const hoverPopup = new maplibregl.Popup({ closeButton: false, closeOnClick: false, offset: 12 })
+    // Registered before the risk dots, whose fuller tooltip wins where they overlap.
+    const showArea = (html) => (e) => {
+      const p = e.features?.[0]?.properties
+      if (p) hoverPopup.setLngLat(e.lngLat).setHTML(`<div class="hover-popup">${html(p)}</div>`).addTo(m)
+    }
+    m.on('mousemove', 'fema-fill', showArea((p) => `<b>FEMA zone ${escapeHtml(p.FLD_ZONE)}</b>${p.SFHA_TF === 'T' ? 'High-risk flood area' : 'Not a high-risk flood area'}`))
+    m.on('mousemove', 'fire-fill', showArea((p) => `<b>${escapeHtml(p.name)}</b>${p.active ? 'Active fire' : `Past burn scar${p.year ? `, ${p.year}` : ''}`}`))
+    m.on('mouseleave', 'fema-fill', () => hoverPopup.remove())
+    m.on('mouseleave', 'fire-fill', () => hoverPopup.remove())
     const showHover = (e) => {
       const f = e.features && e.features[0]
       if (!f) return
@@ -581,6 +664,9 @@ export default function App() {
 
     map.current = m
     if (import.meta.env.DEV) window.__map = m   // handy for debugging in the browser console
+    // MapLibre only watches the window; the map's own box also changes with the layout.
+    const resizer = new ResizeObserver(() => m.resize())
+    resizer.observe(mapEl.current)
 
     // Center on the laptop's location; fall back to the last search, then stay on the US view.
     function goToSaved() {
@@ -604,8 +690,41 @@ export default function App() {
       goToSaved()
     }
 
-    return () => m.remove()
+    return () => { resizer.disconnect(); m.remove() }
   }, [])
+
+  // Air, FEMA zone, fire and nearby places for the property on screen, fetched once per location.
+  useEffect(() => {
+    if (!selected) {
+      setHazards({ key: null, data: null, loading: false })
+      if (data.current.hazards) { data.current.hazards = null; applyOverlays() }
+      return
+    }
+    const p = selected.features.parcel
+    const lat = p?.lat ?? selected.features.lat
+    const lng = p?.lng ?? selected.features.lng
+    const key = `${lat.toFixed(5)},${lng.toFixed(5)}`
+    if (hazards.key === key) return
+    setHazards({ key, data: null, loading: true })
+    const finish = (d) => setHazards((h) => {
+      if (h.key !== key) return h
+      data.current.hazards = d
+      applyOverlays()
+      return { key, data: d, loading: false }
+    })
+    apiFetch(`${API_BASE}/hazards?lat=${lat}&lng=${lng}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then(finish)
+      .catch(() => finish(null))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selected])
+
+  // Sidebar checkboxes -> map layers.
+  useEffect(() => {
+    layersRef.current = layers
+    if (selected) applyOverlays()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [layers])
 
   // Tap-water quality for the property on screen, fetched once per location.
   useEffect(() => {
@@ -668,201 +787,258 @@ export default function App() {
     else m.jumpTo({ pitch: 0 })
   }, [terrain3d])
 
+  const hazardList = [
+    { id: 'flood', label: 'Flood', score: floodScore(selected) },
+    { id: 'air', label: 'Air', score: airScore(hazards.data?.air) },
+    { id: 'fire', label: 'Fire', score: fireScore(hazards.data?.fire) },
+    { id: 'water', label: 'Water', score: waterScore(tap.data) },
+  ]
+  const hazardScores = Object.fromEntries(hazardList.map((h) => [h.id, h.score]))
+  const updating = loading || hazards.loading || tap.loading
+
   return (
     <div className="app">
-      <div className="map" ref={mapEl} />
-
-      <div className="panel">
-        <div className="panel-header">
-        <h1>Stormwater Flood-Risk Map</h1>
-        <p className="sub">Search an address or click any point to trace runoff and get an AI risk score.</p>
-
-        <form className="search" onSubmit={handleSearch}>
+      <header className="topbar">
+        <h1><span>OmniGuard:</span> Multi-Hazard Community Resilience Atlas</h1>
+        <form className="search" role="search" onSubmit={handleSearch}>
           <div className="search-row">
             <input
               type="text"
               required
               value={query}
               placeholder="Search an address…"
+              aria-label="Search an address"
+              role="combobox"
+              aria-expanded={showSuggestions && suggestions.length > 0}
+              aria-controls="address-suggestions"
+              aria-autocomplete="list"
+              aria-activedescendant={activeIndex >= 0 ? `suggestion-${activeIndex}` : undefined}
               onChange={handleQueryChange}
               onKeyDown={handleKeyDown}
               onFocus={() => suggestions.length > 0 && setShowSuggestions(true)}
               onBlur={() => setTimeout(() => setShowSuggestions(false), 150)}
             />
             <button type="submit" disabled={searching}>{searching ? '…' : 'Go'}</button>
-            <button type="button" className="clear-btn" onClick={clearAll} title="Clear">✕</button>
+            <button type="button" className="clear-btn" onClick={clearAll} title="Clear" aria-label="Clear search and results">✕</button>
           </div>
           {showSuggestions && suggestions.length > 0 && (
-            <ul className="suggestions">
+            <ul className="suggestions" id="address-suggestions" role="listbox" aria-label="Address suggestions">
               {suggestions.map((s, i) => (
-                <li key={i} className={i === activeIndex ? 'active' : ''} onMouseDown={(e) => { e.preventDefault(); selectSuggestion(s) }}>{s.label}</li>
+                <li key={i} id={`suggestion-${i}`} role="option" aria-selected={i === activeIndex} className={i === activeIndex ? 'active' : ''} onMouseDown={(e) => { e.preventDefault(); selectSuggestion(s) }}>{s.label}</li>
               ))}
             </ul>
           )}
         </form>
+      </header>
 
-        <div className="basemaps">
-          {Object.entries(STYLES).map(([k, v]) => (
-            <button key={k} className={basemap === k ? 'active' : ''} onClick={() => setBasemap(k)}>
-              {v.label}
-            </button>
-          ))}
-        </div>
+      <CompoundBanner result={selected ? compound(hazardList) : null} loading={!!selected && updating} searched={loading} />
 
-        <button className={`terrain-toggle ${terrain3d ? 'active' : ''}`} onClick={() => setTerrain3d(!terrain3d)}>
-          ⛰ 3D Terrain {terrain3d ? 'On' : 'Off'}
-        </button>
-
-        <div className="scenario">
-          <button className={scenario === 'normal' ? 'active' : ''} onClick={() => { setRainError(null); setScenario('normal') }} aria-pressed={scenario === 'normal'}>
-            Normal rain (1 in)
+      <main className="workspace">
+        <aside className="sidebar" aria-label="Map controls">
+          <button type="button" className="sidebar-toggle" aria-expanded={controlsOpen} aria-controls="sidebar-body" onClick={() => setControlsOpen(!controlsOpen)}>
+            {controlsOpen ? 'Hide map controls' : 'Show map controls'}
           </button>
-          <div className={`storm-box${scenario === 'storm' ? ' active' : ''}`}>
-            <button type="button" onClick={applyStorm} aria-pressed={scenario === 'storm'}>Heavy storm</button>
-            <input
-              type="number"
-              inputMode="decimal"
-              min="0"
-              max={MAX_RAIN_IN}
-              step="0.1"
-              value={stormInput}
-              onChange={(e) => setStormInput(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); applyStorm() } }}
-              onBlur={() => { if (scenario === 'storm') applyStorm() }}
-              aria-label={`Storm rainfall in inches over 24 hours, 0 to ${MAX_RAIN_IN}`}
-              aria-invalid={!!rainError}
-              aria-describedby={rainError ? 'rain-error' : undefined}
-            />
-            <span aria-hidden="true">in</span>
-          </div>
-        </div>
-        {rainError && <p id="rain-error" className="rain-error" role="alert">{rainError}</p>}
+          <div id="sidebar-body" className={`sidebar-body${controlsOpen ? ' open' : ''}`}>
+            <fieldset className="side-group">
+              <legend>Quick filters</legend>
+              {LAYER_FILTERS.map(({ id, label }) => (
+                <label key={id} className="check">
+                  <input type="checkbox" checked={layers[id]} onChange={() => setLayers((l) => ({ ...l, [id]: !l[id] }))} />
+                  {label}
+                </label>
+              ))}
+            </fieldset>
 
-        <div className="report-bar">
-          {reportMode ? (
-            <>
-              <span className="report-hint">Click the map where the {reportMode === 'drain' ? 'storm drain' : 'pond'} is…</span>
-              <button type="button" onClick={() => setReporting(null)}>Cancel</button>
-            </>
-          ) : (
-            <>
-              <span className="report-label">Missing on the map?</span>
-              <button type="button" onClick={() => setReporting('pond')} title="Mark a pond the map data doesn't show">+ Pond</button>
-              <button type="button" onClick={() => setReporting('drain')} title="Mark a storm drain where runoff leaves">+ Storm drain</button>
-            </>
-          )}
-        </div>
+            <div className="side-group">
+              <h2>Rainfall</h2>
+              <div className="scenario">
+                <button className={scenario === 'normal' ? 'active' : ''} onClick={() => { setRainError(null); setScenario('normal') }} aria-pressed={scenario === 'normal'}>
+                  Normal rain (1 in)
+                </button>
+                <div className={`storm-box${scenario === 'storm' ? ' active' : ''}`}>
+                  <button type="button" onClick={applyStorm} aria-pressed={scenario === 'storm'}>Heavy storm</button>
+                  <input
+                    type="number"
+                    inputMode="decimal"
+                    min="0"
+                    max={MAX_RAIN_IN}
+                    step="0.1"
+                    value={stormInput}
+                    onChange={(e) => setStormInput(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); applyStorm() } }}
+                    onBlur={() => { if (scenario === 'storm') applyStorm() }}
+                    aria-label={`Storm rainfall in inches over 24 hours, 0 to ${MAX_RAIN_IN}`}
+                    aria-invalid={!!rainError}
+                    aria-describedby={rainError ? 'rain-error' : undefined}
+                  />
+                  <span aria-hidden="true">in</span>
+                </div>
+              </div>
+              {rainError && <p id="rain-error" className="rain-error" role="alert">{rainError}</p>}
+            </div>
 
-        <div className="legend">
-          <span><i style={{ background: '#27ae60' }} /> Low</span>
-          <span><i style={{ background: '#f1c40f' }} /> Moderate</span>
-          <span><i style={{ background: '#e67e22' }} /> High</span>
-          <span><i style={{ background: '#c0392b' }} /> Severe</span>
-          <span className="info-icon">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <circle cx="12" cy="12" r="10" />
-              <path d="M12 16v-4" />
-              <path d="M12 8h.01" />
-            </svg>
-            <span className="info-tooltip">
-              <b>Flood risk score (0–100)</b>
+            <div className="side-group">
+              <h2>Map style</h2>
+              <div className="basemaps">
+                {Object.entries(STYLES).map(([k, v]) => (
+                  <button key={k} className={basemap === k ? 'active' : ''} aria-pressed={basemap === k} onClick={() => setBasemap(k)}>
+                    {v.label}
+                  </button>
+                ))}
+              </div>
+              <button className={`terrain-toggle ${terrain3d ? 'active' : ''}`} aria-pressed={terrain3d} onClick={() => setTerrain3d(!terrain3d)}>
+                <span aria-hidden="true">⛰</span> 3D Terrain {terrain3d ? 'On' : 'Off'}
+              </button>
+            </div>
+
+            <div className="side-group">
+              <h2>Missing on the map?</h2>
+              <div className="report-bar">
+                {reportMode ? (
+                  <>
+                    <span className="report-hint" role="status">Click the map where the {reportMode === 'drain' ? 'storm drain' : 'pond'} is…</span>
+                    <button type="button" onClick={() => setReporting(null)}>Cancel</button>
+                  </>
+                ) : (
+                  <>
+                    <button type="button" onClick={() => setReporting('pond')} title="Mark a pond the map data doesn't show">+ Pond</button>
+                    <button type="button" onClick={() => setReporting('drain')} title="Mark a storm drain where runoff leaves">+ Storm drain</button>
+                  </>
+                )}
+              </div>
+            </div>
+
+            <div className="side-group legend">
+              <h2>Legend</h2>
               <ul>
-                <li><i style={{ background: '#1a9850' }} /><span><b>Low (0–24)</b> — generally safe</span></li>
-                <li><i style={{ background: '#fee08b' }} /><span><b>Moderate (25–49)</b> — water may pool in heavy rain</span></li>
-                <li><i style={{ background: '#fdae61' }} /><span><b>High (50–74)</b> — likely flooding in storms</span></li>
-                <li><i style={{ background: '#d73027' }} /><span><b>Severe (75+)</b> — flood-prone, needs action</span></li>
+                <li><i style={{ background: '#1a9850' }} /><span><b>Low (0–24)</b> generally safe</span></li>
+                <li><i style={{ background: '#fee08b' }} /><span><b>Moderate (25–49)</b> water may pool in heavy rain</span></li>
+                <li><i style={{ background: '#fdae61' }} /><span><b>High (50–74)</b> likely flooding in storms</span></li>
+                <li><i style={{ background: '#d73027' }} /><span><b>Severe (75+)</b> flood-prone, needs action</span></li>
+                <li><i className="swatch" style={{ background: 'rgba(30, 110, 220, .5)', borderColor: '#1560bd' }} /><span>FEMA high-risk flood zone</span></li>
+                <li><i className="swatch" style={{ background: 'rgba(30, 110, 220, .12)', borderColor: '#7ba7dc' }} /><span>Other FEMA zone</span></li>
+                <li><i className="swatch" style={{ background: 'transparent', borderColor: '#e0201b', borderWidth: 3 }} /><span>Active fire</span></li>
+                <li><i className="swatch" style={{ background: 'rgba(224, 32, 27, .18)', borderColor: '#d98a88' }} /><span>Past burn scar</span></li>
+                <li><i className="swatch glyph" style={{ background: '#6a3fb5' }}>S</i><span>Shelter</span></li>
+                <li><i className="swatch glyph" style={{ background: '#c2185b' }}>H</i><span>Hospital</span></li>
               </ul>
-              <span className="hint">Pins mark each issue — hover one to see the problem. Cyan dashes = where your rain runs; orange dashes = uphill water coming in; blue area = where it pools.</span>
-            </span>
-          </span>
-        </div>
+              <p className="hint">Pins mark each issue; hover or tab to one to see the problem. Cyan dashes show where your rain runs, orange dashes show uphill water coming in, and the blue area is where it pools.</p>
+            </div>
+          </div>
+        </aside>
+
+        <div className="map-wrap">
+          <div className="map" ref={mapEl} role="region" aria-label="Map. Click a spot to assess it." />
         </div>
 
-        <div className="panel-body">
-        {error && <div className="error">{error}</div>}
-        {loading && <div className="loading"><span className="spinner" /> Analyzing terrain and asking the AI…</div>}
+        <section className="briefing" aria-label="AI briefing">
+          <div role="status" aria-live="polite">
+            {error && <div className="error">{error}</div>}
+            {loading && <div className="loading"><span className="spinner" /> Analyzing terrain and asking the AI…</div>}
+          </div>
 
-        {selected && !loading && (
-          <div className="result">
-            <h2>{selected.features.parcel ? lotTitle(selected.features.parcel.address) : 'Property assessment'}</h2>
-            {selected.features.parcel ? (
-              <div className="where ok">✓ Matched to the official property lot (outlined in yellow)</div>
-            ) : selected.searched ? (
-              <div className="where warn">📍 Approximate location — official lot data isn't available here. If the pin isn't on your house, click your roof to assess that exact spot.</div>
-            ) : (
-              <div className="where">📍 Assessing the exact spot you clicked</div>
-            )}
-            <Tabs
-              value={tab}
-              onChange={setTab}
-              tabs={[
-                { id: 'flood', label: '🌊 Flood risk' },
-                { id: 'tap', label: '🚰 Tap water', badge: tap.data?.level },
-              ]}
-            />
-            {tab === 'tap' ? (
-              <div role="tabpanel" id="panel-tap" aria-labelledby="tab-tap">
-                <TapWaterPanel state={tap} />
-              </div>
-            ) : (
-            <div role="tabpanel" id="panel-flood" aria-labelledby="tab-flood">
-            {selected.features.scenario === 'storm' && <div className="storm-badge">⛈ Storm scenario · {fmtIn(selected.features.rainInches)} in of rain in 24 h</div>}
-            {selected.features.surface ? (
-              <div className="survey-badge fresh" title="Lot drainage traced on Google's current aerial surface model (Solar API), not the older public elevation survey.">
-                🛰 Aerial surface {selected.features.surface.imageryDate}
-                {imageryBeforeHome(selected.features) ? ' (lot graded, before the home was built)' : ''}
-                {selected.features.surveyYear ? ` · public survey ${selected.features.surveyYear}` : ''}
-              </div>
-            ) : selected.features.terrainPredatesHome ? (
-              <div className="survey-badge stale" title="The public elevation survey shows the land before this home was built, so runoff follows how new lots are graded instead of the old contours.">
-                📅 Terrain survey {selected.features.surveyYear} · Home built {selected.features.parcel?.yearBuilt} — routed by lot grading
-              </div>
-            ) : selected.features.surveyYear ? (
-              <div className="survey-badge">📅 Terrain survey {selected.features.surveyYear}{selected.features.parcel?.yearBuilt ? ` · Home built ${selected.features.parcel.yearBuilt}` : ''}</div>
-            ) : null}
-            <div className="scores">
-              <ScoreCard
-                title="Terrain model"
-                hint="Calculated from elevation, slope, drainage and paving"
-                score={selected.features.deterministicRisk}
-              />
-              {selected.ai.available !== false ? (
-                <ScoreCard title="AI engineer" hint="Independent second opinion from the same measurements" score={selected.ai.riskScore} />
+          {!selected && !loading && (
+            <div className="empty">
+              <h2>Start with an address</h2>
+              <ol>
+                <li>Search an address above, or click any spot on the map.</li>
+                <li>Set the rainfall to test a bigger or smaller storm.</li>
+                <li>Read the AI briefing here and the hazard cards below.</li>
+              </ol>
+            </div>
+          )}
+
+          {selected && !loading && (
+            <div className="result">
+              <p className="eyebrow">AI briefing</p>
+              <h2>{selected.features.parcel ? lotTitle(selected.features.parcel.address) : 'Property assessment'}</h2>
+              {selected.features.parcel ? (
+                <div className="where ok">✓ Matched to the official property lot (outlined in yellow)</div>
+              ) : selected.searched ? (
+                <div className="where warn">📍 Approximate location — official lot data isn't available here. If the pin isn't on your house, click your roof to assess that exact spot.</div>
               ) : (
-                <div className="score muted"><span>AI engineer</span><b>—</b><small>unavailable</small></div>
+                <div className="where">📍 Assessing the exact spot you clicked</div>
+              )}
+              <Tabs
+                value={tab}
+                onChange={setTab}
+                tabs={[
+                  { id: 'flood', label: '🌊 Flood risk' },
+                  { id: 'tap', label: '🚰 Tap water', badge: tap.data?.level },
+                ]}
+              />
+              {tab === 'tap' ? (
+                <div role="tabpanel" id="panel-tap" aria-labelledby="tab-tap">
+                  <TapWaterPanel state={tap} />
+                </div>
+              ) : (
+              <div role="tabpanel" id="panel-flood" aria-labelledby="tab-flood">
+              {selected.features.scenario === 'storm' && <div className="storm-badge">⛈ Storm scenario · {fmtIn(selected.features.rainInches)} in of rain in 24 h</div>}
+              {selected.features.surface ? (
+                <div className="survey-badge fresh" title="Lot drainage traced on Google's current aerial surface model (Solar API), not the older public elevation survey.">
+                  🛰 Aerial surface {selected.features.surface.imageryDate}
+                  {imageryBeforeHome(selected.features) ? ' (lot graded, before the home was built)' : ''}
+                  {selected.features.surveyYear ? ` · public survey ${selected.features.surveyYear}` : ''}
+                </div>
+              ) : selected.features.terrainPredatesHome ? (
+                <div className="survey-badge stale" title="The public elevation survey shows the land before this home was built, so runoff follows how new lots are graded instead of the old contours.">
+                  📅 Terrain survey {selected.features.surveyYear} · Home built {selected.features.parcel?.yearBuilt} — routed by lot grading
+                </div>
+              ) : selected.features.surveyYear ? (
+                <div className="survey-badge">📅 Terrain survey {selected.features.surveyYear}{selected.features.parcel?.yearBuilt ? ` · Home built ${selected.features.parcel.yearBuilt}` : ''}</div>
+              ) : null}
+              <div className="scores">
+                <ScoreCard
+                  title="Terrain model"
+                  hint="Calculated from elevation, slope, drainage and paving"
+                  score={selected.features.deterministicRisk}
+                />
+                {selected.ai.available !== false ? (
+                  <ScoreCard title="AI engineer" hint="Independent second opinion from the same measurements" score={selected.ai.riskScore} />
+                ) : (
+                  <div className="score muted"><span>AI engineer</span><b>—</b><small>unavailable</small></div>
+                )}
+              </div>
+              <p className="summary">{selected.ai.summary}</p>
+              {selected.features.scenario === 'storm' && selected.ai.stormNote && <p className="storm-note">⛈ {selected.ai.stormNote}</p>}
+              {selected.ai.issues && (
+                <div className="issues">
+                  <strong>⚠️ Issues</strong>
+                  <ul>{selected.ai.issues.split(';').map((x) => x.trim()).filter(Boolean).map((x, i) => <li key={i}>{x}</li>)}</ul>
+                </div>
+              )}
+              {selected.ai.recommendation && (
+                <div className="recommendation">
+                  <strong>💡 What to do</strong>
+                  <ul className="actions">{actionItems(selected.ai.recommendation).map((x, i) => <li key={i}>{x}</li>)}</ul>
+                </div>
+              )}
+              <WaterGoes features={selected.features} onShow={(ls) => map.current?.flyTo({ center: [ls.lng, ls.lat], zoom: 18 })} />
+              <div className="features">
+                <span title="Height above sea level">Elevation {selected.features.elevation.toFixed(1)} m</span>
+                <span title="Steepest downhill slope">Slope {selected.features.slope.toFixed(1)}%</span>
+                <span title="Land whose runoff flows through this spot">Uphill area {formatArea(selected.features.upstreamAreaM2)}</span>
+                <span title={selected.features.parcel?.imperviousSource ? `Estimated from ${selected.features.parcel.imperviousSource}` : 'Roofs, driveways and roads (map-derived estimate)'}>
+                  Paved {selected.features.imperviousness.toFixed(0)}%{pavedSource(selected.features.parcel?.imperviousSource)}
+                </span>
+                <span title="Height compared with the surrounding ~200 m">{relLabel(selected.features.relativeLow)}</span>
+              </div>
+              {selected.id && <div className="saved">✓ Saved · same result every time you check this house</div>}
+              </div>
               )}
             </div>
-            <p className="summary">{selected.ai.summary}</p>
-            {selected.features.scenario === 'storm' && selected.ai.stormNote && <p className="storm-note">⛈ {selected.ai.stormNote}</p>}
-            {selected.ai.issues && (
-              <div className="issues">
-                <strong>⚠️ Issues</strong>
-                <ul>{selected.ai.issues.split(';').map((x) => x.trim()).filter(Boolean).map((x, i) => <li key={i}>{x}</li>)}</ul>
-              </div>
-            )}
-            {selected.ai.recommendation && (
-              <div className="recommendation">
-                <strong>💡 What to do</strong> {selected.ai.recommendation}
-              </div>
-            )}
-            <WaterGoes features={selected.features} onShow={(ls) => map.current?.flyTo({ center: [ls.lng, ls.lat], zoom: 18 })} />
-            <div className="features">
-              <span title="Height above sea level">Elevation {selected.features.elevation.toFixed(1)} m</span>
-              <span title="Steepest downhill slope">Slope {selected.features.slope.toFixed(1)}%</span>
-              <span title="Land whose runoff flows through this spot">Uphill area {formatArea(selected.features.upstreamAreaM2)}</span>
-              <span title={selected.features.parcel?.imperviousSource ? `Estimated from ${selected.features.parcel.imperviousSource}` : 'Roofs, driveways and roads (map-derived estimate)'}>
-                Paved {selected.features.imperviousness.toFixed(0)}%{pavedSource(selected.features.parcel?.imperviousSource)}
-              </span>
-              <span title="Height compared with the surrounding ~200 m">{relLabel(selected.features.relativeLow)}</span>
-            </div>
-            {selected.id && <div className="saved">✓ Saved · same result every time you check this house</div>}
-            </div>
-            )}
-          </div>
-        )}
-        </div>
-      </div>
+          )}
+        </section>
+      </main>
 
+      <HazardCards
+        selected={selected}
+        hazards={hazards}
+        tap={tap}
+        scores={hazardScores}
+        onOpenTap={() => { setTab('tap'); document.querySelector('.briefing')?.scrollIntoView({ block: 'nearest', behavior: 'smooth' }) }}
+        onShowFacility={showFacility}
+      />
     </div>
   )
 }
@@ -946,6 +1122,11 @@ function WaterGoes({ features, onShow }) {
       <div className="caveat">Based on USGS elevation surveys, which can predate new construction — ponds or grading built since may not appear.</div>
     </div>
   )
+}
+
+// The AI's advice as separate action items: one per sentence, or per semicolon-separated step.
+function actionItems(text) {
+  return text.split(/(?<=[.!?])\s+|;\s*/).map((x) => x.trim()).filter(Boolean)
 }
 
 function formatArea(m2) {

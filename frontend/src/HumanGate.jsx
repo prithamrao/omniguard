@@ -91,8 +91,8 @@ export default function HumanGate({ children }) {
   return (
     <main className="gate" aria-labelledby="gate-title">
       <div className="gate-card">
-        <p className="gate-eyebrow">Stormwater Flood-Risk Map</p>
-        <h1 id="gate-title">Where does your rain go?</h1>
+        <p className="gate-eyebrow">OmniGuard</p>
+        <h1 id="gate-title">What risks does your address face?</h1>
         {state === 'checking' ? (
           <p className="gate-text" role="status">Loading…</p>
         ) : (

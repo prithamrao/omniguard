@@ -114,6 +114,76 @@ public sealed class LowSpot
     public List<Coord> Cells { get; set; } = new();
 }
 
+/// <summary>The other hazards around an address (air, FEMA flood zone, fire, shelters/hospitals).</summary>
+public sealed class Hazards
+{
+    public AirQuality? Air { get; set; }
+    public FloodZoneInfo? FloodZone { get; set; }
+    public FireInfo? Fire { get; set; }
+    public List<Facility> Shelters { get; set; } = new();
+    public List<Facility> Hospitals { get; set; } = new();
+    /// <summary>FEMA shelters open right now within 50 km (during a declared emergency).</summary>
+    public int OpenShelterCount { get; set; }
+}
+
+public sealed class AirQuality
+{
+    public int Aqi { get; set; }
+    public string Category { get; set; } = "";
+    public double? Pm25 { get; set; }
+    public string AsOf { get; set; } = "";
+    /// <summary>Daily maximum US AQI for the last 7 days, oldest first.</summary>
+    public List<AirDay> History { get; set; } = new();
+}
+
+public sealed class AirDay
+{
+    public string Date { get; set; } = "";
+    public int MaxAqi { get; set; }
+}
+
+public sealed class FloodZoneInfo
+{
+    public string Zone { get; set; } = "";
+    public string Subtype { get; set; } = "";
+    /// <summary>True for FEMA's Special Flood Hazard Area (the 1%-a-year, "100-year" floodplain).</summary>
+    public bool HighRisk { get; set; }
+    public string Meaning { get; set; } = "";
+    /// <summary>FEMA zone outlines around the address (GeoJSON), for the map.</summary>
+    public System.Text.Json.Nodes.JsonNode? Overlay { get; set; }
+}
+
+public sealed class FireInfo
+{
+    public double SearchKm { get; set; }
+    public List<FireEvent> Active { get; set; } = new();
+    public List<FireEvent> Past { get; set; } = new();
+    /// <summary>Fire perimeters (GeoJSON, properties.active true/false), for the map.</summary>
+    public System.Text.Json.Nodes.JsonNode? Overlay { get; set; }
+}
+
+public sealed class FireEvent
+{
+    public string Name { get; set; } = "";
+    public double? Acres { get; set; }
+    public int? Year { get; set; }
+    public double DistanceKm { get; set; }
+    public bool Active { get; set; }
+}
+
+public sealed class Facility
+{
+    /// <summary>"shelter" or "hospital".</summary>
+    public string Kind { get; set; } = "";
+    public string Name { get; set; } = "";
+    public string Address { get; set; } = "";
+    public string Detail { get; set; } = "";
+    public bool Emergency { get; set; }
+    public double Lat { get; set; }
+    public double Lng { get; set; }
+    public double DistanceKm { get; set; }
+}
+
 /// <summary>Tap-water quality summary for the public water system serving an address (EPA data).</summary>
 public sealed class TapWater
 {

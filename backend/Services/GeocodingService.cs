@@ -63,7 +63,8 @@ public sealed class GeocodingService
         }
     }
 
-    /// <summary>Type-ahead suggestions. Uses Geoapify (US house-number autocomplete) when a key is set, else Nominatim.</summary>
+    /// <summary>Type-ahead suggestions. Uses Geoapify (US house-number autocomplete) when a key is set, else
+    /// Photon, then Nominatim (which rate-limits typing to about one request a second).</summary>
     public async Task<List<SuggestResult>> SuggestAsync(string query, double? biasLat = null, double? biasLng = null, CancellationToken ct = default)
     {
         if (_geoapifyKey.Length > 0)
@@ -71,6 +72,8 @@ public sealed class GeocodingService
             var geo = await GeoapifySuggestAsync(query, biasLat, biasLng, ct);
             if (geo.Count > 0) return geo;
         }
+        var photon = await PhotonSuggestAsync(query, biasLat, biasLng, ct);
+        if (photon.Count > 0) return photon;
         var results = await NominatimSuggestAsync(query, "us", biasLat, biasLng, ct);
         if (results.Count == 0) results = await NominatimSuggestAsync(query, null, biasLat, biasLng, ct);
         return results;
@@ -94,6 +97,43 @@ public sealed class GeocodingService
                 if (!el.TryGetProperty("lat", out var latEl) || !el.TryGetProperty("lon", out var lonEl)) continue;
                 var hn = el.TryGetProperty("housenumber", out var h) ? h.GetString() : null;
                 list.Add(new SuggestResult { Label = label, Lat = ParseCoord(latEl), Lng = ParseCoord(lonEl), HouseNumber = hn });
+            }
+            return list;
+        }
+        catch
+        {
+            return new();
+        }
+    }
+
+    private async Task<List<SuggestResult>> PhotonSuggestAsync(string query, double? biasLat, double? biasLng, CancellationToken ct)
+    {
+        var bias = biasLat is not null && biasLng is not null
+            ? $"&lat={biasLat.Value.ToString(CultureInfo.InvariantCulture)}&lon={biasLng.Value.ToString(CultureInfo.InvariantCulture)}"
+            : "";
+        var url = $"https://photon.komoot.io/api/?q={Uri.EscapeDataString(query)}&limit=15&lang=en{bias}";
+        string? Prop(JsonElement p, string name) => p.TryGetProperty(name, out var v) ? v.GetString() : null;
+        try
+        {
+            var resp = await _http.GetAsync(url, ct);
+            if (!resp.IsSuccessStatusCode) return new();
+            using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync(ct));
+            if (!doc.RootElement.TryGetProperty("features", out var features)) return new();
+
+            var list = new List<SuggestResult>();
+            foreach (var el in features.EnumerateArray())
+            {
+                var p = el.GetProperty("properties");
+                if (Prop(p, "countrycode") != "US") continue;
+                var hn = Prop(p, "housenumber");
+                var street = Prop(p, "street") ?? Prop(p, "name");
+                if (string.IsNullOrEmpty(street)) continue;
+                var parts = new[] { hn is null ? street : $"{hn} {street}", Prop(p, "city") ?? Prop(p, "county"), Prop(p, "state") };
+                var coords = el.GetProperty("geometry").GetProperty("coordinates");   // [lng, lat]
+                var label = string.Join(", ", parts.Where(x => !string.IsNullOrEmpty(x)));
+                if (list.Any(x => x.Label == label)) continue;
+                list.Add(new SuggestResult { Label = label, Lat = coords[1].GetDouble(), Lng = coords[0].GetDouble(), HouseNumber = hn });
+                if (list.Count == 8) break;
             }
             return list;
         }
