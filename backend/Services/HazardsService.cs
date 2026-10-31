@@ -38,7 +38,7 @@ public sealed class HazardsService
     public HazardsService(HttpClient http, ILogger<HazardsService> log)
     {
         _http = http;
-        _http.Timeout = TimeSpan.FromSeconds(15);
+        _http.Timeout = TimeSpan.FromSeconds(8);   // FEMA can hang; one slow source mustn't hold up every card
         // FEMA answers 403 to requests without a User-Agent.
         _http.DefaultRequestHeaders.UserAgent.ParseAdd("OmniGuard/1.0");
         _log = log;

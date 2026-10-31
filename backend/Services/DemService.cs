@@ -215,26 +215,31 @@ public sealed class DemService
                   "&pixelType=F32" +
                   "&f=image";
 
-        try
+        // USGS sometimes fails the first request for an area, then answers the next one.
+        for (int attempt = 1; attempt <= 3; attempt++)
         {
-            var bytes = await _http.GetByteArrayAsync(url, ct);
-            var dem = ParseFloat32Tiff(bytes);
-            int rows = dem.GetLength(0), cols = dem.GetLength(1);
-            return new DemResult
+            try
             {
-                Dem = dem,
-                Rows = rows,
-                Cols = cols,
-                OriginLat = north,
-                OriginLng = west,
-                PixelLat = -(north - south) / rows,
-                PixelLng = (east - west) / cols,
-            };
+                var bytes = await _http.GetByteArrayAsync(url, ct);
+                var dem = ParseFloat32Tiff(bytes);
+                int rows = dem.GetLength(0), cols = dem.GetLength(1);
+                return new DemResult
+                {
+                    Dem = dem,
+                    Rows = rows,
+                    Cols = cols,
+                    OriginLat = north,
+                    OriginLng = west,
+                    PixelLat = -(north - south) / rows,
+                    PixelLng = (east - west) / cols,
+                };
+            }
+            catch when (!ct.IsCancellationRequested)
+            {
+                if (attempt < 3) await Task.Delay(500 * attempt, ct);
+            }
         }
-        catch
-        {
-            return null;
-        }
+        return null;
     }
 
     private static double[,] ParseFloat32Tiff(byte[] bytes)
