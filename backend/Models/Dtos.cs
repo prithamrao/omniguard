@@ -45,8 +45,10 @@ public sealed class AssessRequest
     public string? HouseNumber { get; set; }
     /// <summary>Street name from a searched address (e.g. "Main Street"), to pick the right lot.</summary>
     public string? Street { get; set; }
-    /// <summary>"normal" (1 in of rain) or "storm" (2.5 in).</summary>
+    /// <summary>"normal" (1 in of rain) or "storm" (2.5 in) — used when RainInches isn't given.</summary>
     public string? Scenario { get; set; }
+    /// <summary>24-hour rainfall to assess, 0-50 inches. Overrides Scenario.</summary>
+    public double? RainInches { get; set; }
 }
 
 /// <summary>A pond or storm drain a user marked on the map (newer than the elevation survey / map data).</summary>
@@ -226,8 +228,10 @@ public sealed class FeatureSet
     [BsonIgnore]
     public List<Hotspot> Hotspots { get; set; } = new();
     public int AlgoVersion { get; set; }
-    /// <summary>"normal" (1 in of rain) or "storm" (2.5 in).</summary>
+    /// <summary>"normal" (the 1-inch baseline) or "storm" (any other rainfall).</summary>
     public string Scenario { get; set; } = "normal";
+    /// <summary>24-hour rainfall this assessment is for, inches.</summary>
+    public double RainInches { get; set; } = 1.0;
     /// <summary>Identifies the exact inputs the AI saw, so a cached AI answer is reused only for identical facts.</summary>
     public string CacheKey { get; set; } = "";
 }
@@ -236,15 +240,17 @@ public sealed class AiAssessment
 {
     public bool Available { get; set; } = true;
     public int RiskScore { get; set; }
-    /// <summary>The AI's score for a heavy 2.5-inch storm (never below RiskScore).</summary>
+    /// <summary>The AI's score for the chosen rainfall (never below RiskScore when it's more than 1 inch,
+    /// never above it when less).</summary>
     public int StormRiskScore { get; set; }
-    /// <summary>What changes for this property in the heavy storm.</summary>
+    /// <summary>What changes for this property at the chosen rainfall.</summary>
     public string StormNote { get; set; } = "";
 
     public static string CategoryFor(int score) => score >= 75 ? "Severe" : score >= 50 ? "High" : score >= 25 ? "Moderate" : "Low";
 
-    /// <summary>The view for a scenario: in a storm the headline score is the storm score.</summary>
-    public AiAssessment ForScenario(string scenario) => scenario != "storm" || !Available ? this : new AiAssessment
+    /// <summary>The view for a rainfall: at anything other than the 1-inch baseline the headline score is the
+    /// score for that rainfall.</summary>
+    public AiAssessment ForRain(double rainInches) => rainInches == 1.0 || !Available ? this : new AiAssessment
     {
         Available = Available, RiskScore = StormRiskScore, StormRiskScore = StormRiskScore, StormNote = StormNote,
         Category = CategoryFor(StormRiskScore), Summary = Summary, Issues = Issues, Recommendation = Recommendation,

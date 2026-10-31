@@ -4,10 +4,12 @@ import 'maplibre-gl/dist/maplibre-gl.css'
 
 import { API_BASE, apiFetch } from './api.js'
 
-const SCENARIOS = {
-  normal: { label: 'Normal rain', mult: 1.0 },
-  storm: { label: 'Heavy storm (2.5 in)', mult: 1.6 },
-}
+// Rainfall: "Normal rain" is always 1 inch; "Heavy storm" takes any 0-50 inch amount.
+const NORMAL_RAIN_IN = 1
+const MAX_RAIN_IN = 50
+// Same factor the server uses to scale risk with rainfall: sqrt(inches).
+const rainFactor = (inches) => Math.sqrt(Math.min(Math.max(inches, 0), MAX_RAIN_IN))
+const fmtIn = (inches) => `${Number(inches.toFixed(2))}`
 
 // Modern vector basemaps (OpenFreeMap — free, no key) + satellite raster.
 const STYLES = {
@@ -170,7 +172,7 @@ export default function App() {
   const data = useRef({ points: [], flowPath: [], streetIndex: null, surface: null, history: [], lowSpot: null, hotspots: [], parcel: null, reports: [], cellDeg: 0.00012 })
   const markers = useRef([])
   const reportMarkers = useRef([])
-  const scenarioRef = useRef('normal')
+  const rainRef = useRef(NORMAL_RAIN_IN)   // rainfall (inches) the property on screen is assessed for
   const lastReq = useRef(null)          // the property on screen, so a scenario switch or new report re-assesses it
   const reportModeRef = useRef(null)    // 'pond' | 'drain' while placing a report
   const pulseRef = useRef(null)
@@ -187,6 +189,9 @@ export default function App() {
   const [basemap, setBasemap] = useState('satellite')
   const [terrain3d, setTerrain3d] = useState(false)
   const [scenario, setScenario] = useState('normal')
+  const [stormInput, setStormInput] = useState('2.5')     // what's typed in the storm box
+  const [stormInches, setStormInches] = useState(2.5)     // the last valid storm amount
+  const [rainError, setRainError] = useState(null)
   const [selected, setSelected] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
@@ -341,7 +346,7 @@ export default function App() {
       const assessRes = await apiFetch(`${API_BASE}/assess`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ lat, lng, houseNumber, street, scenario: scenarioRef.current }),
+        body: JSON.stringify({ lat, lng, houseNumber, street, rainInches: rainRef.current }),
       }).then((r) => r.json())
       if (assessRes.error) {
         setError(assessRes.error)
@@ -618,17 +623,32 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selected])
 
-  // Scenario toggle -> recolor risk layer and re-assess the property on screen for that rain.
+  // Rainfall change -> recolor the risk dots and re-assess the property on screen for that rain.
   useEffect(() => {
-    const changed = scenarioRef.current !== scenario
-    scenarioRef.current = scenario
+    const rain = scenario === 'storm' ? stormInches : NORMAL_RAIN_IN
+    const changed = rainRef.current !== rain
+    rainRef.current = rain
     if (changed) reassess()
-    mult.current = SCENARIOS[scenario].mult
+    mult.current = rainFactor(rain)
     const m = map.current
     if (m && m.getLayer('risk-layer')) {
-      m.setPaintProperty('risk-layer', 'circle-color', riskColorExpr(SCENARIOS[scenario].mult))
+      m.setPaintProperty('risk-layer', 'circle-color', riskColorExpr(mult.current))
     }
-  }, [scenario])
+  }, [scenario, stormInches])
+
+  // Validate the typed storm amount (0-50 in) and switch to it.
+  function applyStorm() {
+    const v = Number(String(stormInput).trim())
+    if (String(stormInput).trim() === '' || !Number.isFinite(v) || v < 0 || v > MAX_RAIN_IN) {
+      setRainError(`Enter a rainfall between 0 and ${MAX_RAIN_IN} inches.`)
+      return
+    }
+    setRainError(null)
+    const inches = Math.round(v * 100) / 100
+    setStormInput(String(inches))
+    setStormInches(inches)
+    setScenario('storm')
+  }
 
   // Basemap switch (skip the initial mount to avoid a redundant setStyle).
   useEffect(() => {
@@ -694,12 +714,29 @@ export default function App() {
         </button>
 
         <div className="scenario">
-          {Object.entries(SCENARIOS).map(([k, v]) => (
-            <button key={k} className={scenario === k ? 'active' : ''} onClick={() => setScenario(k)}>
-              {v.label}
-            </button>
-          ))}
+          <button className={scenario === 'normal' ? 'active' : ''} onClick={() => { setRainError(null); setScenario('normal') }} aria-pressed={scenario === 'normal'}>
+            Normal rain (1 in)
+          </button>
+          <div className={`storm-box${scenario === 'storm' ? ' active' : ''}`}>
+            <button type="button" onClick={applyStorm} aria-pressed={scenario === 'storm'}>Heavy storm</button>
+            <input
+              type="number"
+              inputMode="decimal"
+              min="0"
+              max={MAX_RAIN_IN}
+              step="0.1"
+              value={stormInput}
+              onChange={(e) => setStormInput(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); applyStorm() } }}
+              onBlur={() => { if (scenario === 'storm') applyStorm() }}
+              aria-label={`Storm rainfall in inches over 24 hours, 0 to ${MAX_RAIN_IN}`}
+              aria-invalid={!!rainError}
+              aria-describedby={rainError ? 'rain-error' : undefined}
+            />
+            <span aria-hidden="true">in</span>
+          </div>
         </div>
+        {rainError && <p id="rain-error" className="rain-error" role="alert">{rainError}</p>}
 
         <div className="report-bar">
           {reportMode ? (
@@ -769,7 +806,7 @@ export default function App() {
               </div>
             ) : (
             <div role="tabpanel" id="panel-flood" aria-labelledby="tab-flood">
-            {selected.features.scenario === 'storm' && <div className="storm-badge">⛈ Heavy storm scenario · 2.5 in of rain</div>}
+            {selected.features.scenario === 'storm' && <div className="storm-badge">⛈ Storm scenario · {fmtIn(selected.features.rainInches)} in of rain in 24 h</div>}
             {selected.features.surface ? (
               <div className="survey-badge fresh" title="Lot drainage traced on Google's current aerial surface model (Solar API), not the older public elevation survey.">
                 🛰 Aerial surface {selected.features.surface.imageryDate}
@@ -889,7 +926,7 @@ function WaterGoes({ features, onShow }) {
     return <div className="water-goes">🌊 <b>Where your water goes:</b> rain from here keeps flowing downhill with no closed low spot within 800 m.</div>
   }
   const where = ls.distanceM === 0 ? 'right here — this property sits in it' : `${ls.distanceM.toFixed(0)} m downhill`
-  const rain = features.scenario === 'storm' ? '2.5-inch storm' : '1-inch rain'
+  const rain = features.scenario === 'storm' ? `${fmtIn(features.rainInches)}-inch storm` : '1-inch rain'
   return (
     <div className={`water-goes${ls.overflows ? ' overflow' : ''}`}>
       💧 <b>Where your water goes:</b>{' '}
